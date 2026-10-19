@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stage 2 · Column Raycaster</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+/*
+  STAGE 2 — The classic raycaster (how Wolfenstein 3D worked)
+  ===========================================================
+  New in this stage:
+    • The camera: a position, a direction vector, and a "camera plane" vector.
+    • One ray per screen COLUMN. Each ray walks through the map grid one cell
+      at a time (the "DDA" algorithm) until it hits a wall.
+    • The wall's distance decides how TALL that column of wall is drawn:
+      twice as far away → half as tall. That's all perspective is.
+    • Perpendicular distance instead of straight-line distance, which fixes the
+      "fisheye" bulge. Press F to switch it off and see the difference.
+    • Distance → brightness → character + colour, and darker N/S-facing walls.
+    • A floor and ceiling, with a checkerboard so you can feel yourself moving.
+
+  The screen/input code (sections 1–2) is unchanged from stage 1.
+*/
+
+// ===========================================================================
+// 1. The character screen   (unchanged from stage 1)
+// ===========================================================================
+const RAMP = " .:-=+*#%@";
+const MAX_COLS = 180;
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+
+let cols, rows, cellW, cellH, chars, colors, image, pixels;
+const glyphs = new Map();
+
+function resize() {
+  ctx.font = "bold 100px monospace";
+  const charAspect = ctx.measureText("M").width / 100;
+  const dpr = window.devicePixelRatio || 1;
+  const screenW = Math.floor(window.innerWidth * dpr);
+  const screenH = Math.floor(window.innerHeight * dpr);
+  cellW = Math.max(6, Math.ceil(screenW / MAX_COLS));
+  cellH = Math.round(cellW / charAspect);
+  cols = Math.floor(screenW / cellW);
+  rows = Math.floor(screenH / cellH);
+  canvas.width = cols * cellW;
+  canvas.height = rows * cellH;
+  canvas.style.width = canvas.width / dpr + "px";
+  canvas.style.height = canvas.height / dpr + "px";
+  image = ctx.createImageData(canvas.width, canvas.height);
+  pixels = new Uint32Array(image.data.buffer);
+  glyphs.clear();
+  chars = new Array(cols * rows).fill(" ");
+  colors = new Uint8ClampedArray(cols * rows * 3);
+}
+
+function clear() { chars.fill(" "); colors.fill(0); }
+
+function put(x, y, ch, r, g, b) {
+  if (x < 0 || y < 0 || x >= cols || y >= rows) return;
+  const i = y * cols + x;
+  chars[i] = ch;
+  colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
+}
+
+function text(x, y, str, r = 220, g = 220, b = 220) {
+  for (let k = 0; k < str.length; k++) put(x + k, y, str[k], r, g, b);
+}
+
+function rampChar(L) {
+  const k = Math.floor(L * RAMP.length);
+  return RAMP[Math.max(0, Math.min(RAMP.length - 1, k))];
+}
+
+function glyph(ch) {
+  let g = glyphs.get(ch);
+  if (!g) {
+    const c = document.createElement("canvas");
+    c.width = cellW; c.height = cellH;
+    const gctx = c.getContext("2d", { willReadFrequently: true });
+    gctx.font = `bold ${cellH}px monospace`;
+    gctx.textBaseline = "top";
+    gctx.fillStyle = "#fff";
+    gctx.fillText(ch, 0, 0);
+    const rgba = gctx.getImageData(0, 0, cellW, cellH).data;
+    g = new Uint8Array(cellW * cellH);
+    for (let k = 0; k < g.length; k++) g[k] = rgba[k * 4 + 3];
+    glyphs.set(ch, g);
+  }
+  return g;
+}
+
+function present() {
+  pixels.fill(0xff000000);
+  const W = canvas.width;
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const i = cy * cols + cx;
+      const ch = chars[i];
+      if (ch === " ") continue;
+      const g = glyph(ch);
+      const r = colors[i * 3], gr = colors[i * 3 + 1], b = colors[i * 3 + 2];
+      let k = 0;
+      for (let py = 0; py < cellH; py++) {
+        let p = (cy * cellH + py) * W + cx * cellW;
+        for (let px = 0; px < cellW; px++, k++, p++) {
+          const a = g[k];
+          if (a) pixels[p] = 0xff000000 | ((b * a >> 8) << 16) | ((gr * a >> 8) << 8) | (r * a >> 8);
+        }
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+// ===========================================================================
+// 2. Input   (unchanged, plus one toggle key)
+// ===========================================================================
+const keys = new Set();
+addEventListener("keydown", (e) => keys.add(e.code));
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+
+let fisheye = false;   // F: use straight-line distance, to see why we don't
+addEventListener("keydown", (e) => { if (e.code === "KeyF") fisheye = !fisheye; });
+
+// ===========================================================================
+// 3. The world (same map as stage 1)
+// ===========================================================================
+const MAP = [
+  "####################",
+  "#.......#..........#",
+  "#.......#...BBBBB..#",
+  "#..WW...#...B...B..#",
+  "#..WW.......B...B..#",
+  "#.......#...BB.BB..#",
+  "####.####..........#",
+  "#..................#",
+  "#..M.....M....#....#",
+  "#.............#....#",
+  "#..M.....M....#....#",
+  "#.........######...#",
+  "#..................#",
+  "####################",
+];
+const MAP_W = MAP[0].length, MAP_H = MAP.length;
+
+const WALL_COLORS = {
+  "#": [150, 150, 165],   // stone
+  "B": [200, 90, 60],     // brick
+  "W": [170, 115, 60],    // wood
+  "M": [90, 170, 95],     // moss
+};
+
+function isWall(x, y) {
+  const mx = Math.floor(x), my = Math.floor(y);
+  if (mx < 0 || my < 0 || mx >= MAP_W || my >= MAP_H) return true;
+  return MAP[my][mx] !== ".";
+}
+
+// ===========================================================================
+// 4. The camera
+// ===========================================================================
+/*
+  Seen from above (map y grows DOWNWARD, so "south" is +y):
+
+        dir - plane        dir        dir + plane
+              \             |             /
+   left edge   \            |            /   right edge
+   of screen    \           |           /    of screen
+                 \          |          /
+                  \         |         /
+                   \        |        /
+                    \       |       /
+                     \      |      /
+                       [ player ]
+
+    dir   – where the player looks (a vector of length 1)
+    plane – perpendicular to dir. Rays fan out from (dir - plane) to (dir + plane).
+            Its length sets the field of view: 0.66 → 2·atan(0.66) ≈ 66°.
+*/
+const PLANE_LEN = 0.66;
+const player = { x: 2.5, y: 2.5, dirX: 1, dirY: 0, planeX: 0, planeY: PLANE_LEN };
+
+// Rotate dir and plane together by the same angle (a 2D rotation matrix).
+// Because +y points south, a positive angle turns clockwise = to the right.
+function rotate(angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  const { dirX, dirY, planeX, planeY } = player;
+  player.dirX = dirX * c - dirY * s;
+  player.dirY = dirX * s + dirY * c;
+  player.planeX = planeX * c - planeY * s;
+  player.planeY = planeX * s + planeY * c;
+}
+
+// ===========================================================================
+// 5. Update: move + turn
+// ===========================================================================
+const MOVE_SPEED = 3.5;   // cells per second
+const TURN_SPEED = 2.2;   // radians per second
+const RADIUS = 0.2;       // keep the camera a little away from walls
+
+function update(dt) {
+  if (keys.has("ArrowLeft") || keys.has("KeyQ")) rotate(-TURN_SPEED * dt);
+  if (keys.has("ArrowRight") || keys.has("KeyE")) rotate(TURN_SPEED * dt);
+
+  // Forward = dir. Right = dir rotated 90° clockwise = (-dirY, dirX).
+  let fwd = 0, side = 0;
+  if (keys.has("KeyW") || keys.has("ArrowUp")) fwd += 1;
+  if (keys.has("KeyS") || keys.has("ArrowDown")) fwd -= 1;
+  if (keys.has("KeyD")) side += 1;
+  if (keys.has("KeyA")) side -= 1;
+  let dx = player.dirX * fwd - player.dirY * side;
+  let dy = player.dirY * fwd + player.dirX * side;
+  const len = Math.hypot(dx, dy);
+  if (len === 0) return;
+  dx = (dx / len) * MOVE_SPEED * dt;
+  dy = (dy / len) * MOVE_SPEED * dt;
+
+  // One axis at a time, testing a point RADIUS ahead of us in the direction of travel.
+  if (!isWall(player.x + dx + Math.sign(dx) * RADIUS, player.y)) player.x += dx;
+  if (!isWall(player.x, player.y + dy + Math.sign(dy) * RADIUS)) player.y += dy;
+}
+
+// ===========================================================================
+// 6. Casting one ray (DDA = "digital differential analyzer")
+// ===========================================================================
+/*
+  Instead of creeping along the ray in tiny steps (slow, and can skip corners),
+  we jump straight from one grid line to the next:
+
+    deltaX = how far along the ray we travel to cross ONE whole cell in x
+    sideX  = how far along the ray until we cross the NEXT x grid line
+
+  Each step we cross whichever grid line (x or y) is closer, move into that
+  cell, and check if it's a wall. A ray crosses only a handful of cells, so
+  this is very fast.
+
+  The "distance" we get back is measured in units of the ray vector
+  (dir + plane·camX), whose forward part has length 1. That makes it the
+  distance straight ahead to the wall — perpendicular to the camera plane —
+  NOT the straight-line distance from the player. Straight-line distance makes
+  walls at the screen edges look further away than they are, and flat walls
+  bulge like a fisheye lens.
+*/
+let hitDist, hitSide, hitCell;   // results of castRay()
+
+function castRay(rayX, rayY) {
+  let mapX = Math.floor(player.x), mapY = Math.floor(player.y);
+  const deltaX = rayX === 0 ? 1e30 : Math.abs(1 / rayX);
+  const deltaY = rayY === 0 ? 1e30 : Math.abs(1 / rayY);
+
+  let stepX, stepY, sideX, sideY;
+  if (rayX < 0) { stepX = -1; sideX = (player.x - mapX) * deltaX; }
+  else          { stepX = 1;  sideX = (mapX + 1 - player.x) * deltaX; }
+  if (rayY < 0) { stepY = -1; sideY = (player.y - mapY) * deltaY; }
+  else          { stepY = 1;  sideY = (mapY + 1 - player.y) * deltaY; }
+
+  for (let i = 0; i < 100; i++) {
+    if (sideX < sideY) { sideX += deltaX; mapX += stepX; hitSide = 0; }   // crossed an x line (an E/W face)
+    else               { sideY += deltaY; mapY += stepY; hitSide = 1; }   // crossed a y line (a N/S face)
+    if (MAP[mapY][mapX] !== ".") break;   // the map is walled in, so every ray hits something
+  }
+  hitCell = MAP[mapY][mapX];
+  // We already added one delta too many: step back to where we hit the line.
+  hitDist = hitSide === 0 ? sideX - deltaX : sideY - deltaY;
+}
+
+// ===========================================================================
+// 7. Render
+// ===========================================================================
+const MAX_DIST = 14;   // things fade to black by this distance
+
+function render() {
+  clear();
+  const horizon = rows / 2;
+
+  // "Focal length" in rows: how many rows tall a 1-unit-high wall is when it's
+  // 1 unit away. Half the screen width (pixels) / PLANE_LEN gives it in pixels;
+  // dividing by the cell height converts to rows. Using pixels for both
+  // directions is what keeps walls in proportion even though cells aren't square.
+  const focal = (cols * cellW / 2) / PLANE_LEN / cellH;
+
+  for (let x = 0; x < cols; x++) {
+    // camX goes from -1 (left edge) to +1 (right edge).
+    const camX = 2 * (x + 0.5) / cols - 1;
+    const rayX = player.dirX + player.planeX * camX;
+    const rayY = player.dirY + player.planeY * camX;
+    castRay(rayX, rayY);
+
+    const dist = fisheye ? hitDist * Math.hypot(rayX, rayY) : hitDist;
+    const wallH = focal / dist;                 // farther → shorter
+    const top = horizon - wallH / 2;
+    const bottom = horizon + wallH / 2;
+
+    // Wall brightness: fade with distance; N/S faces a bit darker than E/W faces.
+    let L = Math.max(0, 1 - dist / MAX_DIST);
+    if (hitSide === 1) L *= 0.65;
+    const [wr, wg, wb] = WALL_COLORS[hitCell];
+    const wallCh = rampChar(L);
+
+    for (let y = 0; y < rows; y++) {
+      const cy = y + 0.5;                       // centre of this row
+      if (cy >= top && cy <= bottom) {
+        put(x, y, wallCh, wr * L, wg * L, wb * L);
+        continue;
+      }
+      // Floor or ceiling. The eye is at height 0.5 (half a wall), so a row that is
+      // p rows away from the horizon shows the floor at distance (0.5·focal)/p.
+      const p = Math.abs(cy - horizon);
+      const rowDist = (0.5 * focal) / p;
+      const fade = Math.max(0, 1 - rowDist / MAX_DIST);
+      if (cy > bottom) {
+        // Where on the floor is this? Walk rowDist along this column's ray.
+        const fx = player.x + rayX * rowDist;
+        const fy = player.y + rayY * rowDist;
+        const checker = (Math.floor(fx) + Math.floor(fy)) & 1;
+        const F = fade * (checker ? 0.55 : 0.38);
+        put(x, y, rampChar(F), 150 * F, 125 * F, 95 * F);
+      } else {
+        const C = fade * 0.3;
+        put(x, y, rampChar(C), 90 * C, 105 * C, 150 * C);
+      }
+    }
+  }
+
+  // HUD
+  text(1, 0, " STAGE 2 · column raycaster · W/S move · A/D strafe · ←/→ turn · F fisheye ", 255, 255, 255);
+  text(1, 1, ` ${cols} rays per frame (one per column)${fisheye ? " · FISHEYE ON (straight-line distance)" : ""} `, 160, 160, 160);
+}
+
+// ===========================================================================
+// 8. The game loop   (unchanged)
+// ===========================================================================
+let lastTime = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+  update(dt);
+  render();
+  present();
+  requestAnimationFrame(frame);
+}
+
+resize();
+addEventListener("resize", resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

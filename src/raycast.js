@@ -1,0 +1,64 @@
+// 3D DDA ray casting through a floor's block grid (learn/03 §6).
+import { B } from "./world.js";
+
+// Ghost planks are solid to walk on but only visible in the dark: rays pass straight
+// through them unless the renderer turns this on (your torch is out).
+let ghostVisible = false;
+export function setGhostVisible(v) { ghostVisible = v; }
+
+export const hit = { t: 0, block: 0, nx: 0, ny: 0, nz: 0, x: 0, y: 0, z: 0 };
+
+// Returns true if the ray hits a block within maxT (details in `hit`).
+// If `seen` is given (the auto-map), every column the ray passes through while the air
+// is lit — or within torchRange of the eye — is marked as seen.
+// If `holes` is given, a column is also marked there when the ray passes down through
+// its floor layer: you've looked into a pit or chasm (only the 3D view passes this).
+const HOLE_Z = 1;   // the floor layer (world.js FLOOR_Z - 1)
+export function castRay(floor, ox, oy, oz, dx, dy, dz, maxT, seen = null, torchRange = 0, holes = null) {
+  const W = floor.w, D = floor.d, H = floor.h, WD = W * D;
+  const blocks = floor.blocks, lit = floor.litMask;
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
+  const tDeltaX = Math.abs(1 / dx), tDeltaY = Math.abs(1 / dy), tDeltaZ = Math.abs(1 / dz);
+  let tMaxX = dx === 0 ? Infinity : (dx > 0 ? x + 1 - ox : ox - x) * tDeltaX;
+  let tMaxY = dy === 0 ? Infinity : (dy > 0 ? y + 1 - oy : oy - y) * tDeltaY;
+  let tMaxZ = dz === 0 ? Infinity : (dz > 0 ? z + 1 - oz : oz - z) * tDeltaZ;
+  let axis = 0, t = 0, lastLit = true;
+
+  while (true) {
+    if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += stepX; t = tMaxX; tMaxX += tDeltaX; axis = 0; }
+    else if (tMaxY < tMaxZ)             { y += stepY; t = tMaxY; tMaxY += tDeltaY; axis = 1; }
+    else                                { z += stepZ; t = tMaxZ; tMaxZ += tDeltaZ; axis = 2; }
+    if (t > maxT) return false;
+    if ((x < 0 && stepX < 0) || (x >= W && stepX > 0) ||
+        (y < 0 && stepY < 0) || (y >= D && stepY > 0) ||
+        (z < 0 && stepZ < 0) || (z >= H && stepZ > 0)) return false;
+    if (x < 0 || y < 0 || z < 0 || x >= W || y >= D || z >= H) { lastLit = false; continue; }
+
+    const i = x + y * W + z * WD;
+    const b = blocks[i];
+    if (b && (b !== B.GHOST || ghostVisible)) {
+      hit.t = t; hit.block = b; hit.x = x; hit.y = y; hit.z = z;
+      hit.nx = axis === 0 ? -stepX : 0;
+      hit.ny = axis === 1 ? -stepY : 0;
+      hit.nz = axis === 2 ? -stepZ : 0;
+      if (seen && lastLit) seen[x + y * W] = 1;
+      return true;
+    }
+    if (seen) {
+      lastLit = lit[i] === 1 || t < torchRange;
+      if (lastLit) {
+        seen[x + y * W] = 1;
+        if (holes && z === HOLE_Z) holes[x + y * W] = 1;
+      }
+    }
+  }
+}
+
+// Can a point see another point? (Nothing solid in between.)
+export function lineOfSight(floor, ax, ay, az, bx, by, bz) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az;
+  const dist = Math.hypot(dx, dy, dz);
+  if (dist < 1e-6) return true;
+  return !castRay(floor, ax, ay, az, dx / dist, dy / dist, dz / dist, dist);
+}

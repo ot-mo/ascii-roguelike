@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stage 5 · Lighting and Colour</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+/*
+  STAGE 5 — Light, colour and texture (the finished demo)
+  ========================================================
+  New in this stage:
+    • Textures: each block type draws a pattern (bricks, planks, tiles, moss…)
+      from WHERE on the face the ray landed. Pattern = brightness changes, and
+      brightness = different characters, so textures show up as ASCII detail.
+    • Sunlight with real shadows: from every surface point we cast a SECOND ray
+      toward the sun. If it hits a block, that point is in shadow.
+    • Sky light and lamp light, spread through the world with a flood fill
+      (the way Minecraft lights its worlds). Computed once at start-up, then each
+      surface just looks up how much light is in the air in front of it.
+      A side effect: corners come out darker, like soft "ambient occlusion".
+    • A torch (flashlight) on the player, fog, a sky with a sun and moving clouds,
+      and a night mode where only lamps and your torch light the world.
+    • The final colour of a cell is (texture colour) × (all light reaching it).
+      Its brightness picks the character, so lit areas are dense and bright,
+      shadows sparse and dark.
+
+  Keys: F torch · H shadows · N day/night · M map  (plus everything from stage 4)
+
+  Unchanged from stage 4: screen (1), world (3), player + physics (4–5), ray casting (6).
+*/
+
+// ===========================================================================
+// 1. The character screen   (unchanged from stage 1)
+// ===========================================================================
+const RAMP = " .:-=+*#%@";
+const MAX_COLS = 180;
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+
+let cols, rows, cellW, cellH, chars, colors, image, pixels;
+const glyphs = new Map();
+
+function resize() {
+  ctx.font = "bold 100px monospace";
+  const charAspect = ctx.measureText("M").width / 100;
+  const dpr = window.devicePixelRatio || 1;
+  const screenW = Math.floor(window.innerWidth * dpr);
+  const screenH = Math.floor(window.innerHeight * dpr);
+  cellW = Math.max(6, Math.ceil(screenW / MAX_COLS));
+  cellH = Math.round(cellW / charAspect);
+  cols = Math.floor(screenW / cellW);
+  rows = Math.floor(screenH / cellH);
+  canvas.width = cols * cellW;
+  canvas.height = rows * cellH;
+  canvas.style.width = canvas.width / dpr + "px";
+  canvas.style.height = canvas.height / dpr + "px";
+  image = ctx.createImageData(canvas.width, canvas.height);
+  pixels = new Uint32Array(image.data.buffer);
+  glyphs.clear();
+  chars = new Array(cols * rows).fill(" ");
+  colors = new Uint8ClampedArray(cols * rows * 3);
+}
+
+function clear() { chars.fill(" "); colors.fill(0); }
+
+function put(x, y, ch, r, g, b) {
+  if (x < 0 || y < 0 || x >= cols || y >= rows) return;
+  const i = y * cols + x;
+  chars[i] = ch;
+  colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
+}
+
+function text(x, y, str, r = 220, g = 220, b = 220) {
+  for (let k = 0; k < str.length; k++) put(x + k, y, str[k], r, g, b);
+}
+
+function rampChar(L) {
+  const k = Math.floor(L * RAMP.length);
+  return RAMP[Math.max(0, Math.min(RAMP.length - 1, k))];
+}
+
+function glyph(ch) {
+  let g = glyphs.get(ch);
+  if (!g) {
+    const c = document.createElement("canvas");
+    c.width = cellW; c.height = cellH;
+    const gctx = c.getContext("2d", { willReadFrequently: true });
+    gctx.font = `bold ${cellH}px monospace`;
+    gctx.textBaseline = "top";
+    gctx.fillStyle = "#fff";
+    gctx.fillText(ch, 0, 0);
+    const rgba = gctx.getImageData(0, 0, cellW, cellH).data;
+    g = new Uint8Array(cellW * cellH);
+    for (let k = 0; k < g.length; k++) g[k] = rgba[k * 4 + 3];
+    glyphs.set(ch, g);
+  }
+  return g;
+}
+
+function present() {
+  pixels.fill(0xff000000);
+  const W = canvas.width;
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const i = cy * cols + cx;
+      const ch = chars[i];
+      if (ch === " ") continue;
+      const g = glyph(ch);
+      const r = colors[i * 3], gr = colors[i * 3 + 1], b = colors[i * 3 + 2];
+      let k = 0;
+      for (let py = 0; py < cellH; py++) {
+        let p = (cy * cellH + py) * W + cx * cellW;
+        for (let px = 0; px < cellW; px++, k++, p++) {
+          const a = g[k];
+          if (a) pixels[p] = 0xff000000 | ((b * a >> 8) << 16) | ((gr * a >> 8) << 8) | (r * a >> 8);
+        }
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+// ===========================================================================
+// 2. Input: keyboard + mouse look   (new: F / H / N toggles)
+// ===========================================================================
+const keys = new Set();
+let sensitivity = 0.0025;
+let fovDeg = 75;
+let showMap = true;
+let torchOn = true;     // F
+let shadowsOn = true;   // H
+let night = false;      // N
+
+addEventListener("keydown", (e) => {
+  keys.add(e.code);
+  if (e.code === "Space" || e.code.startsWith("Arrow")) e.preventDefault();
+  if (e.code === "Digit1") sensitivity = Math.max(0.0005, sensitivity / 1.25);
+  if (e.code === "Digit2") sensitivity = Math.min(0.01, sensitivity * 1.25);
+  if (e.code === "KeyM") showMap = !showMap;
+  if (e.code === "KeyF") torchOn = !torchOn;
+  if (e.code === "KeyH") shadowsOn = !shadowsOn;
+  if (e.code === "KeyN") night = !night;
+});
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+
+canvas.addEventListener("click", () => {
+  const p = canvas.requestPointerLock();
+  if (p && p.catch) p.catch(() => {});
+});
+addEventListener("mousemove", (e) => {
+  if (document.pointerLockElement !== canvas) return;
+  player.yaw += e.movementX * sensitivity;
+  player.pitch -= e.movementY * sensitivity;
+  clampPitch();
+});
+addEventListener("wheel", (e) => {
+  fovDeg = Math.max(30, Math.min(110, fovDeg + Math.sign(e.deltaY) * 5));
+});
+
+// ===========================================================================
+// 3. The 3D world   (unchanged from stage 3)
+// ===========================================================================
+const LAYERS = [
+  [ // z = 0 — the ground: tiles in the hall, planks in the brick room, grass outside
+    "################",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTTTGGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "####T####GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPPPGGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "################",
+  ],
+  [ // z = 1 — feet level: walls, marble columns (C), crates (W), stairs, doorways
+    "#########MMMMMMM",
+    "#.......#......M",
+    "#.C...C.#......M",
+    "#.......#...#..M",
+    "#..............M",
+    "#.......##.....M",
+    "#.C...C.##.....M",
+    "#.......##.....M",
+    "####.####......M",
+    "B.......B...M..M",
+    "B.WW....B...M..M",
+    "B.W.....B...M..M",
+    "B.......B...M.WM",
+    "B.............WM",
+    "B.......B......M",
+    "BBBBBBBBBMMMMMMM",
+  ],
+  [ // z = 2 — eye level: lamps (L) in the walls, windows into the courtyard
+    "####L####MMMMMMM",
+    "#.......#......M",
+    "L.C...C.#......M",
+    "#.......#...#..M",
+    "#..............M",
+    "#.......##.....M",
+    "L.C...C.##.....M",
+    "#.......#......M",
+    "####.####......M",
+    "B.......B...M..M",
+    "B.W.........M..M",
+    "B..............M",
+    "L.......B......M",
+    "B..............M",
+    "B.......B......M",
+    "BBBBLBBBBMMMMMMM",
+  ],
+  [ // z = 3 — above the doorways (lintels close them), courtyard walls end
+    "#########.......",
+    "#.......#.......",
+    "#.C...C.#.......",
+    "#.......#...#...",
+    "#.......#.......",
+    "#.......##......",
+    "#.C...C.#.......",
+    "#.......#.......",
+    "#########.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "BBBBBBBBB.......",
+  ],
+  [ // z = 4 — the roof (R) with a skylight over the hall, and a lamp on the courtyard pillar
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRR...RRR...L...",
+    "RRR...RRR.......",
+    "RRR...RRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+  ],
+];
+
+const BLOCK_TYPES = {
+  "#": [150, 150, 165],   // stone
+  "B": [190, 85, 55],     // brick
+  "W": [170, 115, 60],    // wooden crate
+  "M": [85, 160, 90],     // mossy stone
+  "C": [220, 215, 205],   // marble column
+  "T": [180, 165, 140],   // floor tiles
+  "G": [90, 155, 60],     // grass
+  "P": [140, 95, 55],     // wooden planks
+  "R": [165, 70, 55],     // roof tiles
+  "L": [255, 215, 130],   // lamp (glows)
+};
+
+const WORLD_W = LAYERS[0][0].length;
+const WORLD_D = LAYERS[0].length;
+const WORLD_H = LAYERS.length;
+const BLOCK_CHARS = Object.keys(BLOCK_TYPES);
+const BLOCK_COLOR = [null, ...BLOCK_CHARS.map((c) => BLOCK_TYPES[c])];
+const LAMP = BLOCK_CHARS.indexOf("L") + 1;
+const world = new Uint8Array(WORLD_W * WORLD_D * WORLD_H);
+for (let z = 0; z < WORLD_H; z++)
+  for (let y = 0; y < WORLD_D; y++)
+    for (let x = 0; x < WORLD_W; x++)
+      world[x + y * WORLD_W + z * WORLD_W * WORLD_D] = BLOCK_CHARS.indexOf(LAYERS[z][y][x]) + 1;
+
+function blockAt(x, y, z) {
+  if (x < 0 || y < 0 || z < 0 || x >= WORLD_W || y >= WORLD_D || z >= WORLD_H) return 0;
+  return world[x + y * WORLD_W + z * WORLD_W * WORLD_D];
+}
+
+// ===========================================================================
+// 4. The player   (unchanged from stage 4)
+// ===========================================================================
+const RADIUS = 0.3, HEIGHT = 1.6, EYE_HEIGHT = 1.45;
+const WALK_SPEED = 4.5, SPRINT_SPEED = 8;
+const GRAVITY = 24, JUMP_SPEED = 8.2;
+
+const player = { x: 2.5, y: 4.5, z: 1, vz: 0, onGround: false, yaw: 0, pitch: 0 };
+
+function clampPitch() {
+  const LIMIT = 89 * Math.PI / 180;
+  player.pitch = Math.max(-LIMIT, Math.min(LIMIT, player.pitch));
+}
+
+// ===========================================================================
+// 5. Physics   (unchanged from stage 4)
+// ===========================================================================
+function solidAt(x, y, z) {
+  if (z >= WORLD_H) return false;
+  if (x < 0 || y < 0 || z < 0 || x >= WORLD_W || y >= WORLD_D) return true;
+  return blockAt(x, y, z) !== 0;
+}
+
+function bodyCollides() {
+  const x0 = Math.floor(player.x - RADIUS), x1 = Math.floor(player.x + RADIUS);
+  const y0 = Math.floor(player.y - RADIUS), y1 = Math.floor(player.y + RADIUS);
+  const z0 = Math.floor(player.z), z1 = Math.floor(player.z + HEIGHT);
+  for (let z = z0; z <= z1; z++)
+    for (let y = y0; y <= y1; y++)
+      for (let x = x0; x <= x1; x++)
+        if (solidAt(x, y, z)) return true;
+  return false;
+}
+
+const EPS = 0.001;
+function moveAxis(axis, amount) {
+  if (amount === 0) return;
+  player[axis] += amount;
+  if (!bodyCollides()) return;
+  const p = player[axis];
+  if (axis === "z") {
+    if (amount < 0) { player.z = Math.floor(p) + 1; player.onGround = true; }
+    else player.z = Math.floor(p + HEIGHT) - HEIGHT - EPS;
+    player.vz = 0;
+  } else {
+    player[axis] = amount > 0
+      ? Math.floor(p + RADIUS) - RADIUS - EPS
+      : Math.floor(p - RADIUS) + 1 + RADIUS + EPS;
+  }
+}
+
+function update(dt) {
+  const LOOK = 2.0 * dt;
+  if (keys.has("ArrowLeft")) player.yaw -= LOOK;
+  if (keys.has("ArrowRight")) player.yaw += LOOK;
+  if (keys.has("ArrowUp")) player.pitch += LOOK;
+  if (keys.has("ArrowDown")) player.pitch -= LOOK;
+  clampPitch();
+
+  const fx = Math.cos(player.yaw), fy = Math.sin(player.yaw);
+  const rx = -fy, ry = fx;
+  let mx = 0, my = 0;
+  if (keys.has("KeyW")) { mx += fx; my += fy; }
+  if (keys.has("KeyS")) { mx -= fx; my -= fy; }
+  if (keys.has("KeyD")) { mx += rx; my += ry; }
+  if (keys.has("KeyA")) { mx -= rx; my -= ry; }
+  const len = Math.hypot(mx, my);
+  const speed = keys.has("ShiftLeft") || keys.has("ShiftRight") ? SPRINT_SPEED : WALK_SPEED;
+  if (len > 0) { mx = (mx / len) * speed; my = (my / len) * speed; }
+
+  if (keys.has("Space") && player.onGround) player.vz = JUMP_SPEED;
+
+  const steps = Math.ceil(dt / 0.008);
+  const h = dt / steps;
+  for (let s = 0; s < steps; s++) {
+    player.vz = Math.max(player.vz - GRAVITY * h, -30);
+    moveAxis("x", mx * h);
+    moveAxis("y", my * h);
+    player.onGround = false;
+    moveAxis("z", player.vz * h);
+  }
+}
+
+// ===========================================================================
+// 6. Casting one ray in 3D   (unchanged from stage 3)
+// ===========================================================================
+let hitT, hitBlock, hitNX, hitNY, hitNZ;
+
+function castRay(ox, oy, oz, dx, dy, dz, maxT) {
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
+  const tDeltaX = Math.abs(1 / dx), tDeltaY = Math.abs(1 / dy), tDeltaZ = Math.abs(1 / dz);
+  let tMaxX = dx === 0 ? Infinity : (dx > 0 ? x + 1 - ox : ox - x) * tDeltaX;
+  let tMaxY = dy === 0 ? Infinity : (dy > 0 ? y + 1 - oy : oy - y) * tDeltaY;
+  let tMaxZ = dz === 0 ? Infinity : (dz > 0 ? z + 1 - oz : oz - z) * tDeltaZ;
+  let axis = 0;
+
+  while (true) {
+    if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += stepX; hitT = tMaxX; tMaxX += tDeltaX; axis = 0; }
+    else if (tMaxY < tMaxZ)             { y += stepY; hitT = tMaxY; tMaxY += tDeltaY; axis = 1; }
+    else                                { z += stepZ; hitT = tMaxZ; tMaxZ += tDeltaZ; axis = 2; }
+    if (hitT > maxT) return false;
+    if ((x < 0 && stepX < 0) || (x >= WORLD_W && stepX > 0) ||
+        (y < 0 && stepY < 0) || (y >= WORLD_D && stepY > 0) ||
+        (z < 0 && stepZ < 0) || (z >= WORLD_H && stepZ > 0)) return false;
+    const b = blockAt(x, y, z);
+    if (b) {
+      hitBlock = b;
+      hitNX = axis === 0 ? -stepX : 0;
+      hitNY = axis === 1 ? -stepY : 0;
+      hitNZ = axis === 2 ? -stepZ : 0;
+      return true;
+    }
+  }
+}
+
+// ===========================================================================
+// 7. Light that spreads through the world (computed once, at start-up)
+// ===========================================================================
+/*
+  Two 3D grids, one number per block of AIR, from 0 (dark) to 1 (full):
+    skyLight  – 1 wherever you can see straight up to the sky, then fading by a
+                fixed step for each block it spreads sideways/down. So light
+                "pours" in through the skylight, doorways and windows.
+    lampLight – 1 at each lamp, fading the same way.
+  Spreading = a breadth-first flood fill: take a lit block, give each air
+  neighbour (level − falloff) if that's brighter than what it has, repeat.
+
+  The grid has one extra layer on top (open air above the roof).
+*/
+const LIGHT_H = WORLD_H + 1;
+const skyLight = new Float32Array(WORLD_W * WORLD_D * LIGHT_H);
+const lampLight = new Float32Array(WORLD_W * WORLD_D * LIGHT_H);
+const lightIndex = (x, y, z) => x + y * WORLD_W + z * WORLD_W * WORLD_D;
+
+function floodFill(grid, queue, falloff) {
+  const NEIGHBOURS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  for (let head = 0; head < queue.length; head++) {      // queue grows as we go
+    const i = queue[head];
+    const x = i % WORLD_W, y = Math.floor(i / WORLD_W) % WORLD_D, z = Math.floor(i / (WORLD_W * WORLD_D));
+    const level = grid[i] - falloff;
+    if (level <= 0) continue;
+    for (const [ox, oy, oz] of NEIGHBOURS) {
+      const nx = x + ox, ny = y + oy, nz = z + oz;
+      if (nx < 0 || ny < 0 || nz < 0 || nx >= WORLD_W || ny >= WORLD_D || nz >= LIGHT_H) continue;
+      if (blockAt(nx, ny, nz)) continue;                   // light doesn't enter solid blocks
+      const n = lightIndex(nx, ny, nz);
+      if (grid[n] < level) { grid[n] = level; queue.push(n); }
+    }
+  }
+}
+
+(function computeLight() {
+  // Sky: every air block with a clear view straight up starts fully lit.
+  const skySeeds = [];
+  for (let y = 0; y < WORLD_D; y++)
+    for (let x = 0; x < WORLD_W; x++)
+      for (let z = LIGHT_H - 1; z >= 0 && !blockAt(x, y, z); z--) {
+        skyLight[lightIndex(x, y, z)] = 1;
+        skySeeds.push(lightIndex(x, y, z));
+      }
+  floodFill(skyLight, skySeeds, 0.14);
+
+  // Lamps: each lamp block is a light source.
+  const lampSeeds = [];
+  for (let z = 0; z < WORLD_H; z++)
+    for (let y = 0; y < WORLD_D; y++)
+      for (let x = 0; x < WORLD_W; x++)
+        if (blockAt(x, y, z) === LAMP) {
+          lampLight[lightIndex(x, y, z)] = 1;
+          lampSeeds.push(lightIndex(x, y, z));
+        }
+  floodFill(lampLight, lampSeeds, 0.12);
+})();
+
+// Smoothly blend the 8 nearest grid values (trilinear interpolation), so light
+// changes gradually across a face instead of in block-sized steps. Values live
+// at block centres, hence the −0.5. Solid blocks hold 0, which is what darkens corners.
+function sampleLight(grid, x, y, z) {
+  x -= 0.5; y -= 0.5; z -= 0.5;
+  const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
+  const fx = x - x0, fy = y - y0, fz = z - z0;
+  let sum = 0;
+  for (let k = 0; k < 8; k++) {
+    const ix = x0 + (k & 1), iy = y0 + ((k >> 1) & 1), iz = z0 + (k >> 2);
+    const w = (k & 1 ? fx : 1 - fx) * (k & 2 ? fy : 1 - fy) * (k & 4 ? fz : 1 - fz);
+    if (w === 0) continue;
+    let v;
+    if (iz < 0) v = 0;
+    else if (ix < 0 || iy < 0 || ix >= WORLD_W || iy >= WORLD_D || iz >= LIGHT_H)
+      v = grid === skyLight ? 1 : 0;                       // outside the world: open air
+    else v = grid[lightIndex(ix, iy, iz)];
+    sum += w * v;
+  }
+  return sum;
+}
+
+// ===========================================================================
+// 8. Materials: a little procedural texture for each block type
+// ===========================================================================
+// A cheap, repeatable "random" number in 0..1 for integer inputs.
+function hash(x, y, z = 0) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 1274126177)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1103515245);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// Smooth noise: random values at grid points, blended in between (used for clouds).
+function noise2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  let fx = x - xi, fy = y - yi;
+  fx = fx * fx * (3 - 2 * fx);
+  fy = fy * fy * (3 - 2 * fy);
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+
+/*
+  Given the block type and the 2D coordinates (u, v) of the hit point on the
+  face, set the surface colour albedoR/G/B (0–255). u and v are world
+  coordinates along the face, so patterns line up across neighbouring blocks.
+*/
+let albedoR, albedoG, albedoB;
+
+function material(block, u, v, isTop) {
+  let [r, g, b] = BLOCK_COLOR[block];
+  let k = 1;                                   // brightness multiplier from the pattern
+  const fu = u - Math.floor(u), fv = v - Math.floor(v);
+  switch (BLOCK_CHARS[block - 1]) {
+    case "B": {   // bricks: 4 courses per block, every other course shifted half a brick
+      const row = Math.floor(v * 4);
+      const bu = u * 2 + (row & 1) * 0.5;
+      const mortar = v * 4 - row < 0.15 || bu - Math.floor(bu) < 0.08;
+      k = mortar ? 0.4 : 0.8 + 0.35 * hash(row, Math.floor(bu));
+      break;
+    }
+    case "#": case "M": {   // big stones, 2 per block, with dark seams
+      const row = Math.floor(v * 2);
+      const su = u * 2 + (row & 1) * 0.5;
+      const seam = v * 2 - row < 0.07 || su - Math.floor(su) < 0.05;
+      k = seam ? 0.5 : 0.75 + 0.3 * hash(row, Math.floor(su), 3);
+      if (BLOCK_CHARS[block - 1] === "M" && hash(Math.floor(u * 5), Math.floor(v * 5), 9) < 0.5) {
+        [r, g, b] = [150, 150, 160];             // mossy stone: patches of bare stone
+      }
+      break;
+    }
+    case "C":     // marble: fluted columns with wavy veins
+      k = 0.82 + 0.12 * Math.sin((u + v * 0.6) * 9 + Math.sin(v * 7) * 1.5);
+      if (!isTop) k *= 0.8 + 0.2 * Math.abs(Math.sin(u * Math.PI * 4));
+      break;
+    case "T": {   // floor tiles: 2×2 per block, checkered, with grout lines
+      const tu = Math.floor(u * 2), tv = Math.floor(v * 2);
+      const grout = u * 2 - tu < 0.06 || v * 2 - tv < 0.06;
+      k = grout ? 0.45 : (tu + tv) & 1 ? 1.0 : 0.72;
+      break;
+    }
+    case "G":     // grass: speckled
+      k = 0.8 + 0.3 * hash(Math.floor(u * 6), Math.floor(v * 6), 7);
+      g *= 0.9 + 0.2 * hash(Math.floor(u * 3), Math.floor(v * 3), 8);
+      break;
+    case "P": {   // planks: 4 boards per block with grain
+      const board = Math.floor(v * 4);
+      const seam = v * 4 - board < 0.1;
+      k = seam ? 0.45 : 0.8 + 0.15 * Math.sin(u * 25 + hash(board, 0) * 20) + 0.1 * hash(board, Math.floor(u));
+      break;
+    }
+    case "W":     // crates: a frame and a diagonal brace
+      if (fu < 0.13 || fu > 0.87 || fv < 0.13 || fv > 0.87 || Math.abs(fu - fv) < 0.1) k = 1.05;
+      else k = 0.6 + 0.1 * Math.sin(fv * 40);
+      break;
+    case "R": {   // roof tiles: overlapping rows, darker at the bottom of each row
+      const f = v * 4 - Math.floor(v * 4);
+      k = isTop ? 0.65 + 0.4 * (u * 3 - Math.floor(u * 3)) : 0.55 + 0.45 * f;
+      break;
+    }
+    case "L": {   // lamp: bright core in a dark frame
+      const d = Math.max(Math.abs(fu - 0.5), Math.abs(fv - 0.5));
+      k = d < 0.3 ? 1.25 : d < 0.38 ? 0.35 : 0.8;
+      break;
+    }
+  }
+  albedoR = r * k; albedoG = g * k; albedoB = b * k;
+}
+
+// ===========================================================================
+// 9. Lighting & shading
+// ===========================================================================
+// Direction TOWARD the sun (normalized). High in the south-west sky.
+const SUN = (() => { const v = [-0.3, 0.35, 0.89], l = Math.hypot(...v); return v.map((c) => c / l); })();
+
+// All the light colours, for day and night. 1.0 = "full strength".
+const LIGHTS = {
+  day:   { sun: [1.25, 1.12, 0.9], sky: [0.55, 0.65, 0.85], ambient: [0.06, 0.06, 0.08], fog: [150, 175, 210] },
+  night: { sun: [0, 0, 0],         sky: [0.05, 0.06, 0.12], ambient: [0.02, 0.02, 0.03], fog: [6, 8, 16] },
+};
+const LAMP_COLOR = [1.4, 0.95, 0.5];
+const TORCH_COLOR = [1.0, 0.85, 0.6];
+const FOG_DENSITY = 0.02;
+const EXPOSURE = 1.8;   // like a camera's exposure: higher = brighter image
+const MAX_DIST = 40;
+
+let outR, outG, outB;   // result of the shade functions below
+let time = 0;
+
+// A ray hit a block: work out its final colour.
+function shadeHit(ex, ey, ez, dx, dy, dz, fX, fY, fZ) {
+  // Save the hit — castRay() is about to be reused for the shadow ray.
+  const t = hitT, block = hitBlock, nx = hitNX, ny = hitNY, nz = hitNZ;
+  const px = ex + dx * t, py = ey + dy * t, pz = ez + dz * t;   // the exact hit point
+
+  // Texture coordinates: the two axes that run ALONG this face.
+  const u = nx !== 0 ? py : px;
+  const v = nz !== 0 ? py : pz;
+  material(block, u, v, nz > 0);
+
+  const L = night ? LIGHTS.night : LIGHTS.day;
+  if (block === LAMP) {                                    // lamps glow: no lighting needed
+    outR = albedoR * 1.2; outG = albedoG * 1.2; outB = albedoB * 1.2;
+  } else {
+    // Start with a little ambient light so nothing is pitch black.
+    let lr = L.ambient[0], lg = L.ambient[1], lb = L.ambient[2];
+
+    // Sky + lamp light, sampled in the air just in front of the face.
+    const sx = px + nx * 0.5, sy = py + ny * 0.5, sz = pz + nz * 0.5;
+    const sky = sampleLight(skyLight, sx, sy, sz);
+    const lamp = sampleLight(lampLight, sx, sy, sz);
+    const lamp2 = lamp * lamp;                            // squared = tighter pools of light
+    lr += L.sky[0] * sky + LAMP_COLOR[0] * lamp2;
+    lg += L.sky[1] * sky + LAMP_COLOR[1] * lamp2;
+    lb += L.sky[2] * sky + LAMP_COLOR[2] * lamp2;
+
+    // Direct sun: only on faces turned toward it, and only if nothing blocks the way.
+    const facing = nx * SUN[0] + ny * SUN[1] + nz * SUN[2];
+    if (!night && facing > 0) {
+      const lit = !shadowsOn ||
+        !castRay(px + nx * 0.001, py + ny * 0.001, pz + nz * 0.001, SUN[0], SUN[1], SUN[2], 40);
+      if (lit) { lr += L.sun[0] * facing; lg += L.sun[1] * facing; lb += L.sun[2] * facing; }
+    }
+
+    // Torch: a cone around where you look, fading with distance.
+    if (torchOn) {
+      const cone = dx * fX + dy * fY + dz * fZ;          // 1 at the crosshair, less toward the edges
+      const spot = 0.25 + 0.75 * Math.min(1, Math.max(0, (cone - 0.9) / 0.08));
+      const k = 1.5 * spot * Math.max(0, -(nx * dx + ny * dy + nz * dz)) / (1 + t * t * 0.07);
+      lr += TORCH_COLOR[0] * k; lg += TORCH_COLOR[1] * k; lb += TORCH_COLOR[2] * k;
+    }
+
+    outR = albedoR * lr; outG = albedoG * lg; outB = albedoB * lb;
+  }
+  applyFog(t, L.fog);
+}
+
+// Fog: blend toward the fog colour the further away something is.
+function applyFog(t, fog) {
+  const f = 1 - Math.exp(-t * FOG_DENSITY);
+  outR += (fog[0] - outR) * f;
+  outG += (fog[1] - outG) * f;
+  outB += (fog[2] - outB) * f;
+}
+
+// The ray left the world going down: endless grass at ground level (z = 1).
+function shadeGround(ex, ey, ez, dx, dy, dz) {
+  const t = (1 - ez) / dz;
+  const L = night ? LIGHTS.night : LIGHTS.day;
+  material(BLOCK_CHARS.indexOf("G") + 1, ex + dx * t, ey + dy * t, true);
+  const s = L.sun, k = L.sky;
+  outR = albedoR * (L.ambient[0] + k[0] + s[0] * SUN[2]);
+  outG = albedoG * (L.ambient[1] + k[1] + s[1] * SUN[2]);
+  outB = albedoB * (L.ambient[2] + k[2] + s[2] * SUN[2]);
+  applyFog(t, L.fog);
+}
+
+// The ray left the world going up: sky, sun, clouds (or stars).
+// Returns how "dense" the characters should be (sky is drawn sparser than solid things).
+function shadeSky(ex, ey, ez, dx, dy, dz) {
+  const h = Math.sqrt(Math.max(0, dz));                   // 0 at the horizon, 1 straight up
+  let density = 0.45;
+  if (night) {
+    outR = 18 - 12 * h; outG = 24 - 14 * h; outB = 50 - 25 * h;
+    const star = hash(Math.floor(dx * 150), Math.floor(dy * 150), Math.floor(dz * 150));
+    if (dz > 0.05 && star > 0.996) { outR = outG = outB = 200 + 55 * hash(1, 2, Math.floor(star * 1e6)); density = 0.75; }
+  } else {
+    outR = 170 - 120 * h; outG = 200 - 105 * h; outB = 240 - 50 * h;
+    const s = dx * SUN[0] + dy * SUN[1] + dz * SUN[2];   // 1 = looking right at the sun
+    if (s > 0.9985) { outR = 255; outG = 250; outB = 215; return 1; }
+    const glow = Math.pow(Math.max(0, s), 60) * 120;
+    outR += glow; outG += glow * 0.9; outB += glow * 0.6;
+  }
+  // Clouds: noise painted on a flat "ceiling" 40 blocks up, drifting with time.
+  if (dz > 0.02) {
+    const k = (40 - ez) / dz;
+    const cxp = (ex + dx * k) * 0.025 + time * 0.02, cyp = (ey + dy * k) * 0.025;
+    const n = noise2(cxp, cyp) * 0.65 + noise2(cxp * 2.3, cyp * 2.3) * 0.35;
+    const c = Math.min(1, Math.max(0, (n - 0.56) / 0.2)) * Math.min(1, dz * 5);  // fade near the horizon
+    const cloud = night ? 40 : 245;
+    outR += (cloud - outR) * c; outG += (cloud - outG) * c; outB += (cloud + 5 - outB) * c;
+    density += 0.45 * c;
+  }
+  return density;
+}
+
+// ===========================================================================
+// 10. Render
+// ===========================================================================
+function render() {
+  clear();
+
+  const cp = Math.cos(player.pitch), sp = Math.sin(player.pitch);
+  const cyaw = Math.cos(player.yaw), syaw = Math.sin(player.yaw);
+  const fX = cp * cyaw, fY = cp * syaw, fZ = sp;
+  const rX = -syaw, rY = cyaw;
+  const uX = -sp * cyaw, uY = -sp * syaw, uZ = cp;
+  const halfW = Math.tan(fovDeg * Math.PI / 360);
+  const halfH = halfW * (rows * cellH) / (cols * cellW);
+  const ex = player.x, ey = player.y, ez = player.z + EYE_HEIGHT;
+
+  for (let cy = 0; cy < rows; cy++) {
+    const v = (1 - 2 * (cy + 0.5) / rows) * halfH;
+    for (let cx = 0; cx < cols; cx++) {
+      const u = (2 * (cx + 0.5) / cols - 1) * halfW;
+      let dx = fX + u * rX + v * uX;
+      let dy = fY + u * rY + v * uY;
+      let dz = fZ + v * uZ;
+      const len = Math.hypot(dx, dy, dz);
+      dx /= len; dy /= len; dz /= len;
+
+      let density = 1;
+      if (castRay(ex, ey, ez, dx, dy, dz, MAX_DIST)) shadeHit(ex, ey, ez, dx, dy, dz, fX, fY, fZ);
+      else if (dz < 0) shadeGround(ex, ey, ez, dx, dy, dz);
+      else density = shadeSky(ex, ey, ez, dx, dy, dz);
+
+      // "Tone mapping": colour × light can go way past 255 in sunlight. This curve
+      // squeezes any value into 0..255, lifting dark areas and softening the brightest.
+      outR = 255 * (1 - Math.exp(-outR / 255 * EXPOSURE));
+      outG = 255 * (1 - Math.exp(-outG / 255 * EXPOSURE));
+      outB = 255 * (1 - Math.exp(-outB / 255 * EXPOSURE));
+
+      // Brightness of the final colour picks the character.
+      const L = Math.max(outR, outG, outB) / 255;
+      put(cx, cy, rampChar(L * density), outR, outG, outB);
+    }
+  }
+
+  put(cols >> 1, rows >> 1, "+", 255, 255, 255);
+  drawMinimap();
+  drawHud();
+}
+
+function drawMinimap() {
+  if (!showMap || cols < 110) return;
+  const ox = cols - WORLD_W * 2 - 2, oy = 4;
+  const zf = Math.floor(player.z);
+  for (let y = 0; y < WORLD_D; y++) {
+    for (let x = 0; x < WORLD_W; x++) {
+      const wall = blockAt(x, y, zf) || blockAt(x, y, zf + 1);
+      const below = blockAt(x, y, zf - 1);
+      let ch = " ", r = 0, g = 0, b = 0;
+      if (wall) { ch = "#"; [r, g, b] = BLOCK_COLOR[wall]; }
+      else if (below) { ch = "."; [r, g, b] = BLOCK_COLOR[below].map((c) => c * 0.5); }
+      put(ox + x * 2, oy + y, ch, r, g, b);
+      put(ox + x * 2 + 1, oy + y, ch, r, g, b);
+    }
+  }
+  const ARROWS = [">", "\\", "v", "/", "<", "\\", "^", "/"];
+  const k = Math.round(player.yaw / (Math.PI / 4)) & 7;
+  put(ox + Math.floor(player.x * 2), oy + Math.floor(player.y), ARROWS[k], 255, 240, 60);
+}
+
+let fps = 60, frameMs = 0;
+function drawHud() {
+  const on = (b) => (b ? "on" : "off");
+  text(1, 0, " STAGE 5 · lighting & colour ", 255, 255, 255);
+  text(1, 1, " WASD move · Shift sprint · Space jump · mouse/arrows look · wheel zoom · 1/2 sensitivity ", 170, 170, 170);
+  text(1, 2, ` F torch ${on(torchOn)} · H shadows ${on(shadowsOn)} · N ${night ? "night" : "day"} · M map `, 255, 210, 120);
+  text(1, 3, ` ${fps.toFixed(0)} fps · ${frameMs.toFixed(1)} ms/frame · ${cols}×${rows} rays `, 120, 220, 120);
+  if (document.pointerLockElement !== canvas) {
+    const msg = "  CLICK TO CAPTURE THE MOUSE  ·  Esc releases it  ";
+    text((cols - msg.length) >> 1, (rows >> 1) + 3, msg, 255, 230, 120);
+  }
+}
+
+// ===========================================================================
+// 11. The game loop
+// ===========================================================================
+let lastTime = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+  time = now / 1000;
+  if (dt > 0) fps += (1 / dt - fps) * 0.05;
+
+  update(dt);
+  const t0 = performance.now();
+  render();
+  present();
+  frameMs += (performance.now() - t0 - frameMs) * 0.05;
+
+  requestAnimationFrame(frame);
+}
+
+resize();
+addEventListener("resize", resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

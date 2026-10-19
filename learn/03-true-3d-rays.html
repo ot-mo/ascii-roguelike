@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stage 3 · True 3D Rays</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+/*
+  STAGE 3 — One 3D ray per character (free look!)
+  ================================================
+  New in this stage:
+    • The world is a real 3D grid of blocks: world[x][y][z], z pointing up.
+      It's written below as horizontal slices ("layers"), like floors of a building.
+    • The camera has a yaw (turn left/right) and a pitch (look up/down), from
+      which we build three vectors: forward, right and up.
+    • Instead of one ray per COLUMN (stage 2), we shoot one ray per CHARACTER.
+      That's what makes looking up and down real: floors, ceilings, arches and
+      windows are actual geometry, not tricks.
+    • The same DDA idea as stage 2, but stepping through x, y AND z grid planes.
+    • Rays that escape the world show sky (looking up) or distant ground (looking down).
+
+  Why stage 2 couldn't look up: it assumed every wall is a vertical strip
+  standing on the floor. Tilt the camera and that assumption breaks.
+  Here nothing is assumed: every character asks "what's in this exact direction?"
+
+  The screen/input code (sections 1–2) is unchanged from stage 1.
+*/
+
+// ===========================================================================
+// 1. The character screen   (unchanged from stage 1)
+// ===========================================================================
+const RAMP = " .:-=+*#%@";
+const MAX_COLS = 180;
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+
+let cols, rows, cellW, cellH, chars, colors, image, pixels;
+const glyphs = new Map();
+
+function resize() {
+  ctx.font = "bold 100px monospace";
+  const charAspect = ctx.measureText("M").width / 100;
+  const dpr = window.devicePixelRatio || 1;
+  const screenW = Math.floor(window.innerWidth * dpr);
+  const screenH = Math.floor(window.innerHeight * dpr);
+  cellW = Math.max(6, Math.ceil(screenW / MAX_COLS));
+  cellH = Math.round(cellW / charAspect);
+  cols = Math.floor(screenW / cellW);
+  rows = Math.floor(screenH / cellH);
+  canvas.width = cols * cellW;
+  canvas.height = rows * cellH;
+  canvas.style.width = canvas.width / dpr + "px";
+  canvas.style.height = canvas.height / dpr + "px";
+  image = ctx.createImageData(canvas.width, canvas.height);
+  pixels = new Uint32Array(image.data.buffer);
+  glyphs.clear();
+  chars = new Array(cols * rows).fill(" ");
+  colors = new Uint8ClampedArray(cols * rows * 3);
+}
+
+function clear() { chars.fill(" "); colors.fill(0); }
+
+function put(x, y, ch, r, g, b) {
+  if (x < 0 || y < 0 || x >= cols || y >= rows) return;
+  const i = y * cols + x;
+  chars[i] = ch;
+  colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
+}
+
+function text(x, y, str, r = 220, g = 220, b = 220) {
+  for (let k = 0; k < str.length; k++) put(x + k, y, str[k], r, g, b);
+}
+
+function rampChar(L) {
+  const k = Math.floor(L * RAMP.length);
+  return RAMP[Math.max(0, Math.min(RAMP.length - 1, k))];
+}
+
+function glyph(ch) {
+  let g = glyphs.get(ch);
+  if (!g) {
+    const c = document.createElement("canvas");
+    c.width = cellW; c.height = cellH;
+    const gctx = c.getContext("2d", { willReadFrequently: true });
+    gctx.font = `bold ${cellH}px monospace`;
+    gctx.textBaseline = "top";
+    gctx.fillStyle = "#fff";
+    gctx.fillText(ch, 0, 0);
+    const rgba = gctx.getImageData(0, 0, cellW, cellH).data;
+    g = new Uint8Array(cellW * cellH);
+    for (let k = 0; k < g.length; k++) g[k] = rgba[k * 4 + 3];
+    glyphs.set(ch, g);
+  }
+  return g;
+}
+
+function present() {
+  pixels.fill(0xff000000);
+  const W = canvas.width;
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const i = cy * cols + cx;
+      const ch = chars[i];
+      if (ch === " ") continue;
+      const g = glyph(ch);
+      const r = colors[i * 3], gr = colors[i * 3 + 1], b = colors[i * 3 + 2];
+      let k = 0;
+      for (let py = 0; py < cellH; py++) {
+        let p = (cy * cellH + py) * W + cx * cellW;
+        for (let px = 0; px < cellW; px++, k++, p++) {
+          const a = g[k];
+          if (a) pixels[p] = 0xff000000 | ((b * a >> 8) << 16) | ((gr * a >> 8) << 8) | (r * a >> 8);
+        }
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+// ===========================================================================
+// 2. Input   (unchanged)
+// ===========================================================================
+const keys = new Set();
+addEventListener("keydown", (e) => keys.add(e.code));
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+
+// ===========================================================================
+// 3. The 3D world
+// ===========================================================================
+// Each layer is a horizontal slice seen from above: x → right, y → down (south).
+// Layer 0 is the ground, layer 4 the roof. '.' is air.
+const LAYERS = [
+  [ // z = 0 — the ground: tiles in the hall, planks in the brick room, grass outside
+    "################",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTTTGGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "#TTTTTTT#GGGGGG#",
+    "####T####GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "#PPPPPPPPGGGGGG#",
+    "#PPPPPPP#GGGGGG#",
+    "################",
+  ],
+  [ // z = 1 — feet level: walls, marble columns (C), crates (W), stairs, doorways
+    "#########MMMMMMM",
+    "#.......#......M",
+    "#.C...C.#......M",
+    "#.......#...#..M",
+    "#..............M",
+    "#.......##.....M",
+    "#.C...C.##.....M",
+    "#.......##.....M",
+    "####.####......M",
+    "B.......B...M..M",
+    "B.WW....B...M..M",
+    "B.W.....B...M..M",
+    "B.......B...M.WM",
+    "B.............WM",
+    "B.......B......M",
+    "BBBBBBBBBMMMMMMM",
+  ],
+  [ // z = 2 — eye level: lamps (L) in the walls, windows into the courtyard
+    "####L####MMMMMMM",
+    "#.......#......M",
+    "L.C...C.#......M",
+    "#.......#...#..M",
+    "#..............M",
+    "#.......##.....M",
+    "L.C...C.##.....M",
+    "#.......#......M",
+    "####.####......M",
+    "B.......B...M..M",
+    "B.W.........M..M",
+    "B..............M",
+    "L.......B......M",
+    "B..............M",
+    "B.......B......M",
+    "BBBBLBBBBMMMMMMM",
+  ],
+  [ // z = 3 — above the doorways (lintels close them), courtyard walls end
+    "#########.......",
+    "#.......#.......",
+    "#.C...C.#.......",
+    "#.......#...#...",
+    "#.......#.......",
+    "#.......##......",
+    "#.C...C.#.......",
+    "#.......#.......",
+    "#########.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "B.......B.......",
+    "BBBBBBBBB.......",
+  ],
+  [ // z = 4 — the roof (R) with a skylight over the hall, and a lamp on the courtyard pillar
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRR...RRR...L...",
+    "RRR...RRR.......",
+    "RRR...RRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+    "RRRRRRRRR.......",
+  ],
+];
+
+const BLOCK_TYPES = {
+  "#": [150, 150, 165],   // stone
+  "B": [190, 85, 55],     // brick
+  "W": [170, 115, 60],    // wooden crate
+  "M": [85, 160, 90],     // mossy stone
+  "C": [220, 215, 205],   // marble column
+  "T": [180, 165, 140],   // floor tiles
+  "G": [90, 155, 60],     // grass
+  "P": [140, 95, 55],     // wooden planks
+  "R": [165, 70, 55],     // roof tiles
+  "L": [255, 215, 130],   // lamp (glows)
+};
+
+// Store the world as one flat array of block ids for speed. 0 = air.
+const WORLD_W = LAYERS[0][0].length;   // x size
+const WORLD_D = LAYERS[0].length;      // y size
+const WORLD_H = LAYERS.length;         // z size
+const BLOCK_CHARS = Object.keys(BLOCK_TYPES);            // id = index + 1
+const BLOCK_COLOR = [null, ...BLOCK_CHARS.map((c) => BLOCK_TYPES[c])];
+const LAMP = BLOCK_CHARS.indexOf("L") + 1;
+const world = new Uint8Array(WORLD_W * WORLD_D * WORLD_H);
+for (let z = 0; z < WORLD_H; z++)
+  for (let y = 0; y < WORLD_D; y++)
+    for (let x = 0; x < WORLD_W; x++)
+      world[x + y * WORLD_W + z * WORLD_W * WORLD_D] = BLOCK_CHARS.indexOf(LAYERS[z][y][x]) + 1;  // '.' → 0
+
+function blockAt(x, y, z) {
+  if (x < 0 || y < 0 || z < 0 || x >= WORLD_W || y >= WORLD_D || z >= WORLD_H) return 0;
+  return world[x + y * WORLD_W + z * WORLD_W * WORLD_D];
+}
+
+// ===========================================================================
+// 4. The camera
+// ===========================================================================
+/*
+  yaw   = turn angle around the vertical axis (0 = looking east, +x)
+  pitch = look up (+) / down (−), limited to just under ±90°
+
+  From those we build three unit vectors:
+    forward – where the centre of the screen points
+    right   – points to the right edge of the screen
+    up      – points to the top edge of the screen (tilts back when you look down)
+
+  A character at screen position (u, v) – both from −1..1-ish – gets the ray
+        direction = forward + u·right + v·up
+  exactly like stage 2's  dir + camX·plane, but in 3D.
+*/
+const FOV = 75 * Math.PI / 180;     // horizontal field of view
+const EYE_HEIGHT = 1.4;             // eyes above the feet (a block is 1 unit)
+const player = { x: 2.5, y: 4.5, z: 1, yaw: 0, pitch: 0 };   // z = feet; standing on the ground (top of layer 0)
+
+// ===========================================================================
+// 5. Update: move + look
+// ===========================================================================
+const MOVE_SPEED = 3.5;   // blocks per second
+const LOOK_SPEED = 2.0;   // radians per second
+const RADIUS = 0.25;
+
+// Is there a block where our body would be? (Body occupies layers 1 and 2.)
+// Stage 4 replaces this with proper 3D collision, gravity and jumping.
+function blocked(x, y) {
+  return blockAt(Math.floor(x), Math.floor(y), 1) || blockAt(Math.floor(x), Math.floor(y), 2);
+}
+
+function update(dt) {
+  if (keys.has("ArrowLeft")) player.yaw -= LOOK_SPEED * dt;
+  if (keys.has("ArrowRight")) player.yaw += LOOK_SPEED * dt;
+  if (keys.has("ArrowUp")) player.pitch += LOOK_SPEED * dt;
+  if (keys.has("ArrowDown")) player.pitch -= LOOK_SPEED * dt;
+  const LIMIT = 89 * Math.PI / 180;
+  player.pitch = Math.max(-LIMIT, Math.min(LIMIT, player.pitch));
+
+  // Walk on the ground plane: forward/right ignore pitch so looking down doesn't slow you.
+  const fx = Math.cos(player.yaw), fy = Math.sin(player.yaw);
+  const rx = -fy, ry = fx;
+  let mx = 0, my = 0;
+  if (keys.has("KeyW")) { mx += fx; my += fy; }
+  if (keys.has("KeyS")) { mx -= fx; my -= fy; }
+  if (keys.has("KeyD")) { mx += rx; my += ry; }
+  if (keys.has("KeyA")) { mx -= rx; my -= ry; }
+  const len = Math.hypot(mx, my);
+  if (len === 0) return;
+  mx = (mx / len) * MOVE_SPEED * dt;
+  my = (my / len) * MOVE_SPEED * dt;
+  if (!blocked(player.x + mx + Math.sign(mx) * RADIUS, player.y)) player.x += mx;
+  if (!blocked(player.x, player.y + my + Math.sign(my) * RADIUS)) player.y += my;
+}
+
+// ===========================================================================
+// 6. Casting one ray in 3D (3D DDA, "Amanatides & Woo")
+// ===========================================================================
+/*
+  Same idea as stage 2, now with three axes. For each axis we track:
+    tDelta = distance along the ray to cross one whole block on that axis
+    tMax   = distance along the ray to the NEXT grid plane on that axis
+  Each step: cross whichever plane is nearest, move into that block, check it.
+  The axis we crossed tells us which FACE we hit (its normal points back at us).
+
+  The ray direction is normalized (length 1), so t is the true distance.
+*/
+let hitT, hitBlock, hitNX, hitNY, hitNZ;   // results of castRay()
+
+function castRay(ox, oy, oz, dx, dy, dz, maxT) {
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
+  const tDeltaX = Math.abs(1 / dx), tDeltaY = Math.abs(1 / dy), tDeltaZ = Math.abs(1 / dz);  // 1/0 = Infinity: never crosses
+  let tMaxX = dx === 0 ? Infinity : (dx > 0 ? x + 1 - ox : ox - x) * tDeltaX;
+  let tMaxY = dy === 0 ? Infinity : (dy > 0 ? y + 1 - oy : oy - y) * tDeltaY;
+  let tMaxZ = dz === 0 ? Infinity : (dz > 0 ? z + 1 - oz : oz - z) * tDeltaZ;
+  let axis = 0;
+
+  while (true) {
+    if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += stepX; hitT = tMaxX; tMaxX += tDeltaX; axis = 0; }
+    else if (tMaxY < tMaxZ)             { y += stepY; hitT = tMaxY; tMaxY += tDeltaY; axis = 1; }
+    else                                { z += stepZ; hitT = tMaxZ; tMaxZ += tDeltaZ; axis = 2; }
+    if (hitT > maxT) return false;
+
+    // Outside the world box and heading further away? Then nothing can be hit.
+    // (We can START outside it, e.g. standing on the roof with our head above the top layer.)
+    if ((x < 0 && stepX < 0) || (x >= WORLD_W && stepX > 0) ||
+        (y < 0 && stepY < 0) || (y >= WORLD_D && stepY > 0) ||
+        (z < 0 && stepZ < 0) || (z >= WORLD_H && stepZ > 0)) return false;
+
+    const b = blockAt(x, y, z);
+    if (b) {
+      hitBlock = b;
+      hitNX = axis === 0 ? -stepX : 0;    // the face normal points back toward the camera
+      hitNY = axis === 1 ? -stepY : 0;
+      hitNZ = axis === 2 ? -stepZ : 0;
+      return true;
+    }
+  }
+}
+
+// ===========================================================================
+// 7. Render: one ray per character
+// ===========================================================================
+const MAX_DIST = 24;
+
+function render() {
+  clear();
+
+  // Camera basis vectors (see section 4).
+  const cp = Math.cos(player.pitch), sp = Math.sin(player.pitch);
+  const cyaw = Math.cos(player.yaw), syaw = Math.sin(player.yaw);
+  const fX = cp * cyaw, fY = cp * syaw, fZ = sp;          // forward
+  const rX = -syaw, rY = cyaw;                            // right (always level, so rZ = 0)
+  const uX = -sp * cyaw, uY = -sp * syaw, uZ = cp;        // up
+
+  // How far the screen edges reach. Horizontally: tan(FOV/2).
+  // Vertically: the same, scaled by screen height/width IN PIXELS, which is what
+  // corrects for characters being taller than they are wide.
+  const halfW = Math.tan(FOV / 2);
+  const halfH = halfW * (rows * cellH) / (cols * cellW);
+
+  const ex = player.x, ey = player.y, ez = player.z + EYE_HEIGHT;   // the eye
+
+  for (let cy = 0; cy < rows; cy++) {
+    const v = (1 - 2 * (cy + 0.5) / rows) * halfH;
+    for (let cx = 0; cx < cols; cx++) {
+      const u = (2 * (cx + 0.5) / cols - 1) * halfW;
+      let dx = fX + u * rX + v * uX;
+      let dy = fY + u * rY + v * uY;
+      let dz = fZ + v * uZ;
+      const len = Math.hypot(dx, dy, dz);
+      dx /= len; dy /= len; dz /= len;
+
+      if (castRay(ex, ey, ez, dx, dy, dz, MAX_DIST)) {
+        // Simple shading: tops brightest, bottoms darkest, sides in between,
+        // everything fading with distance. Lamps ignore all that and glow.
+        let L;
+        if (hitBlock === LAMP) L = 1;
+        else {
+          const face = hitNZ > 0 ? 1.0 : hitNZ < 0 ? 0.45 : hitNX !== 0 ? 0.8 : 0.62;
+          L = face * Math.max(0, 1 - hitT / MAX_DIST);
+        }
+        const [r, g, b] = BLOCK_COLOR[hitBlock];
+        put(cx, cy, rampChar(L), r * L, g * L, b * L);
+      } else if (dz < 0) {
+        // Looking down past the edge of the world: endless grass at ground level (z = 1).
+        const t = (1 - ez) / dz;
+        const L = 0.7 * Math.max(0, 1 - t / (MAX_DIST * 2));
+        put(cx, cy, rampChar(L), 90 * L, 155 * L, 60 * L);
+      } else {
+        // Sky: lighter near the horizon, deeper blue overhead.
+        const L = 0.42 - 0.2 * dz;
+        put(cx, cy, rampChar(L), 120 - 70 * dz, 160 - 70 * dz, 230 - 30 * dz);
+      }
+    }
+  }
+
+  // Crosshair + HUD
+  put(cols >> 1, rows >> 1, "+", 255, 255, 255);
+  text(1, 0, " STAGE 3 · one 3D ray per character · WASD move · arrow keys look (up/down too!) ", 255, 255, 255);
+  text(1, 1, ` ${cols * rows} rays per frame · pitch ${(player.pitch * 180 / Math.PI).toFixed(0)}° `, 160, 160, 160);
+}
+
+// ===========================================================================
+// 8. The game loop   (unchanged)
+// ===========================================================================
+let lastTime = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+  update(dt);
+  render();
+  present();
+  requestAnimationFrame(frame);
+}
+
+resize();
+addEventListener("resize", resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
